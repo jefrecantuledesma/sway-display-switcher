@@ -9,7 +9,7 @@ use text_io::read;
 #[derive(Debug, Clone)]
 struct DisplayConfig {
     description: String,
-    outputs: Vec<String>,
+    outputs: Vec<String>, // store RAW lines (with leading '#' etc.)
     status: String,
 }
 
@@ -88,17 +88,15 @@ fn main() -> io::Result<()> {
 
         // Write the output lines, commented or uncommented based on status
         for output_line in &config.outputs {
-            let line_to_write = if config.status.eq_ignore_ascii_case("Enabled") {
-                output_line.clone() // Uncommented
+            let line_to_write = if is_marker_line(output_line) {
+                // always keep markers; ensure canonical "#! " form
+                canon_marker_line(output_line)
+            } else if config.status.eq_ignore_ascii_case("Enabled") {
+                // uncomment only plain '#'
+                uncomment_plain_hash(output_line)
             } else {
-                // Ensure only single '#' and space
-                if output_line.starts_with("# ") {
-                    output_line.clone()
-                } else if output_line.starts_with('#') {
-                    format!("# {}", output_line.trim_start_matches('#').trim_start())
-                } else {
-                    format!("# {}", output_line)
-                }
+                // comment only plain lines
+                comment_plain_hash(output_line)
             };
             new_display_section.push(line_to_write);
         }
@@ -109,13 +107,13 @@ fn main() -> io::Result<()> {
     // Prepare the new lines by replacing the old display section
     let mut new_lines = Vec::new();
 
-    // Add lines before the display section
+    // Add lines before the display section (include the 'Display Start' line)
     new_lines.extend_from_slice(&lines[..=display_start]);
 
     // Add the new display section
     new_lines.extend(new_display_section);
 
-    // Add lines after the display section
+    // Add lines after the display section (from 'Display End' onward)
     if display_end < lines.len() {
         new_lines.extend_from_slice(&lines[display_end..]);
     }
@@ -151,6 +149,30 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+fn is_marker_line(line: &str) -> bool {
+    let (_indent, rest0) = split_indent(line);
+    let rest = rest0.trim_start();
+    if let Some(after_hash) = rest.strip_prefix('#') {
+        after_hash.trim_start().starts_with('!')
+    } else {
+        rest.starts_with('!')
+    }
+}
+
+fn canon_marker_line(line: &str) -> String {
+    let (indent, rest0) = split_indent(line);
+    let mut rest = rest0.trim_start();
+    if let Some(after_hash) = rest.strip_prefix('#') {
+        rest = after_hash.trim_start();
+    }
+    if let Some(after_bang) = rest.strip_prefix('!') {
+        let text = after_bang.trim_start();
+        format!("{}#! {}", indent, text)
+    } else {
+        line.to_string() // shouldn't happen, but be safe
+    }
+}
+
 // Parse the display section into DisplayConfig structs
 fn parse_configs<'a, I>(lines: I, regex: &Regex) -> Vec<DisplayConfig>
 where
@@ -172,10 +194,9 @@ where
                 outputs: Vec::new(),
             });
         } else if let Some(config) = current_config.as_mut() {
-            // Remove any leading '#' and spaces
-            let trimmed_line = line.trim_start_matches('#').trim_start();
-            if !trimmed_line.is_empty() {
-                config.outputs.push(trimmed_line.to_string());
+            // Keep RAW lines; skip completely blank ones
+            if !line.trim().is_empty() {
+                config.outputs.push(line.to_string());
             }
         }
     }
@@ -213,3 +234,43 @@ fn get_user_selection(total_configs: usize) -> usize {
     }
 }
 
+/* ------------------------- helpers ------------------------- */
+
+// Split into (indentation, rest starting at first non-space char)
+fn split_indent(s: &str) -> (&str, &str) {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    (&s[..i], &s[i..])
+}
+
+// Uncomment a line ONLY if it begins with a plain '#' (not '#!') after indentation.
+fn uncomment_plain_hash(line: &str) -> String {
+    if is_marker_line(line) {
+        return canon_marker_line(line); // keep/comment as "#! ..." if needed
+    }
+    let (indent, rest) = split_indent(line);
+    if let Some(after_hash) = rest.strip_prefix('#') {
+        let rem = after_hash.strip_prefix(' ').unwrap_or(after_hash);
+        format!("{}{}", indent, rem)
+    } else {
+        line.to_string()
+    }
+}
+
+// Comment a line with a single '# ' after indentation (idempotent).
+// Do not change lines that start with '#!' (caller guards, but we double-check).
+fn comment_plain_hash(line: &str) -> String {
+    if is_marker_line(line) {
+        return canon_marker_line(line);
+    }
+    let (indent, rest) = split_indent(line);
+    if rest.starts_with('#') {
+        let collapsed = rest.trim_start_matches('#').trim_start();
+        format!("{}# {}", indent, collapsed)
+    } else {
+        format!("{}# {}", indent, rest)
+    }
+}
