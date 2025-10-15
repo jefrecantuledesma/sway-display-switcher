@@ -4,13 +4,27 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::process;
-use text_io::read;
+
+// ANSI color codes using terminal's color scheme
+const COLOR_RESET: &str = "\x1B[0m";
+const COLOR_BLUE: &str = "\x1B[34m";        // Blue for groups
+const COLOR_CYAN: &str = "\x1B[36m";        // Cyan (light blue) for configs in groups
+const COLOR_GREEN: &str = "\x1B[32m";       // Green for enabled
+const COLOR_RED: &str = "\x1B[31m";         // Red for disabled
+const COLOR_YELLOW: &str = "\x1B[33m";      // Yellow for group label
 
 #[derive(Debug, Clone)]
 struct DisplayConfig {
     description: String,
     outputs: Vec<String>, // store RAW lines (with leading '#' etc.)
     status: String,
+    group: Option<String>, // group name if this config belongs to a group
+}
+
+#[derive(Debug, Clone)]
+struct Group {
+    name: String,
+    expanded: bool,
 }
 
 fn main() -> io::Result<()> {
@@ -42,7 +56,9 @@ fn main() -> io::Result<()> {
 
     // Parse the display section into DisplayConfig structs
     let desc_status_regex = Regex::new(r"# Description = ([^,]+), Status = ([^,]+)").unwrap();
-    let display_configs = parse_configs(display_section, &desc_status_regex);
+    let group_regex = Regex::new(r"## Group = (.+) ##").unwrap();
+    let end_group_regex = Regex::new(r"## End Group ##").unwrap();
+    let display_configs = parse_configs(display_section, &desc_status_regex, &group_regex, &end_group_regex);
     let enabled_config = display_configs
         .iter()
         .position(|c| c.status.eq_ignore_ascii_case("Enabled"));
@@ -57,14 +73,21 @@ fn main() -> io::Result<()> {
         println!("No configuration is currently enabled.");
     }
 
-    // List all available configurations
-    println!("\nAvailable display configurations:");
-    for (i, config) in display_configs.iter().enumerate() {
-        println!("{}. {} [{}]", i + 1, config.description, config.status);
+    // Extract unique groups
+    let mut groups: Vec<Group> = Vec::new();
+    for config in &display_configs {
+        if let Some(group_name) = &config.group {
+            if !groups.iter().any(|g| g.name == *group_name) {
+                groups.push(Group {
+                    name: group_name.clone(),
+                    expanded: false,
+                });
+            }
+        }
     }
 
-    // Prompt user to select a config
-    let selected_index = get_user_selection(display_configs.len());
+    // Interactive loop for displaying and selecting configs
+    let selected_index = interactive_selection(&display_configs, &mut groups);
 
     // Update display_configs: set selected to Enabled, others to Disabled
     let mut updated_display_configs = display_configs.clone();
@@ -77,9 +100,29 @@ fn main() -> io::Result<()> {
     }
 
     // Reconstruct the display section with updated configs
+    // We need to preserve the original structure including group markers
     let mut new_display_section = Vec::new();
+    let mut last_group: Option<String> = None;
 
     for config in &updated_display_configs {
+        // Write group marker if this config starts a new group
+        if let Some(group_name) = &config.group {
+            if last_group.as_ref() != Some(group_name) {
+                // End the previous group if there was one
+                if last_group.is_some() {
+                    new_display_section.push("## End Group ##".to_string());
+                }
+                new_display_section.push(format!("## Group = {} ##", group_name));
+                last_group = Some(group_name.clone());
+            }
+        } else {
+            // This config is not in a group, so end the previous group if there was one
+            if last_group.is_some() {
+                new_display_section.push("## End Group ##".to_string());
+                last_group = None;
+            }
+        }
+
         // Write the description line with updated status
         new_display_section.push(format!(
             "# Description = {}, Status = {}",
@@ -102,6 +145,11 @@ fn main() -> io::Result<()> {
         }
 
         // No blank lines between configurations to prevent extra space
+    }
+
+    // Close any remaining open group at the end
+    if last_group.is_some() {
+        new_display_section.push("## End Group ##".to_string());
     }
 
     // Prepare the new lines by replacing the old display section
@@ -174,15 +222,31 @@ fn canon_marker_line(line: &str) -> String {
 }
 
 // Parse the display section into DisplayConfig structs
-fn parse_configs<'a, I>(lines: I, regex: &Regex) -> Vec<DisplayConfig>
+fn parse_configs<'a, I>(lines: I, regex: &Regex, group_regex: &Regex, end_group_regex: &Regex) -> Vec<DisplayConfig>
 where
     I: IntoIterator<Item = &'a String>,
 {
     let mut configs = Vec::new();
     let mut current_config = None;
+    let mut current_group: Option<String> = None;
 
     for line in lines {
-        if let Some(captures) = regex.captures(line) {
+        // Check for end group marker
+        if end_group_regex.is_match(line) {
+            // Push the previous config if it exists
+            if let Some(config) = current_config.take() {
+                configs.push(config);
+            }
+            // Clear the current group
+            current_group = None;
+        } else if let Some(captures) = group_regex.captures(line) {
+            // Push the previous config if it exists
+            if let Some(config) = current_config.take() {
+                configs.push(config);
+            }
+            // Set the current group
+            current_group = Some(captures[1].trim().to_string());
+        } else if let Some(captures) = regex.captures(line) {
             // Push the previous config if it exists
             if let Some(config) = current_config.take() {
                 configs.push(config);
@@ -192,6 +256,7 @@ where
                 description: captures[1].trim().to_string(),
                 status: captures[2].trim().to_string(),
                 outputs: Vec::new(),
+                group: current_group.clone(),
             });
         } else if let Some(config) = current_config.as_mut() {
             // Keep RAW lines; skip completely blank ones
@@ -209,30 +274,156 @@ where
     configs
 }
 
-// Prompt the user for their configuration choice
-fn get_user_selection(total_configs: usize) -> usize {
+// Interactive selection with expandable/collapsible groups
+fn interactive_selection(display_configs: &[DisplayConfig], groups: &mut [Group]) -> usize {
+    let mut lines_printed = 0;
     loop {
-        println!("Enter the number of the configuration you want to activate, or 'q' to quit:");
+        // Move cursor up and clear the lines we printed last time
+        if lines_printed > 0 {
+            for _ in 0..lines_printed {
+                print!("\x1B[1A\x1B[2K"); // Move up one line and clear it
+            }
+        }
+
+        // Count lines as we print
+        let mut current_lines = 0;
+
+        // Display configurations with groups
+        println!("\nAvailable display configurations:");
+        current_lines += 2; // "\n" creates a line, plus the header line
+
+        let mut display_index = 1;
+        let mut config_map: Vec<usize> = Vec::new(); // maps display index to config index
+        let mut group_map: Vec<String> = Vec::new(); // maps display index to group name (for groups)
+
+        for config in display_configs {
+            if let Some(group_name) = &config.group {
+                // This config belongs to a group
+                let group = groups.iter().find(|g| g.name == *group_name).unwrap();
+
+                // Check if this is the first config in the group
+                let is_first_in_group = display_configs
+                    .iter()
+                    .position(|c| c.group.as_ref() == Some(group_name))
+                    == display_configs.iter().position(|c| c.description == config.description);
+
+                if is_first_in_group {
+                    // Display the group header in blue
+                    println!("{}: {}{}{} {}[Group]{}",
+                        display_index, COLOR_BLUE, group_name, COLOR_RESET,
+                        COLOR_YELLOW, COLOR_RESET);
+                    current_lines += 1;
+                    group_map.push(group_name.clone());
+                    config_map.push(usize::MAX); // sentinel value for group headers
+                    display_index += 1;
+
+                    if group.expanded {
+                        // Show all configs in this group
+                        let group_configs: Vec<(usize, &DisplayConfig)> = display_configs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.group.as_ref() == Some(group_name))
+                            .collect();
+
+                        for (sub_idx, (config_idx, gc)) in group_configs.iter().enumerate() {
+                            // Configs in groups are cyan, status is colored
+                            let status_color = if gc.status.eq_ignore_ascii_case("Enabled") {
+                                COLOR_GREEN
+                            } else {
+                                COLOR_RED
+                            };
+                            println!("  {}.{}: {}{}{} [{}{}{}]",
+                                display_index - 1, sub_idx + 1,
+                                COLOR_CYAN, gc.description, COLOR_RESET,
+                                status_color, gc.status, COLOR_RESET);
+                            current_lines += 1;
+                            config_map.push(*config_idx);
+                        }
+                    }
+                }
+            } else {
+                // Standalone config (not in a group)
+                let status_color = if config.status.eq_ignore_ascii_case("Enabled") {
+                    COLOR_GREEN
+                } else {
+                    COLOR_RED
+                };
+                println!("{}: {} [{}{}{}]",
+                    display_index, config.description,
+                    status_color, config.status, COLOR_RESET);
+                current_lines += 1;
+                config_map.push(display_configs.iter().position(|c| c.description == config.description).unwrap());
+                group_map.push(String::new());
+                display_index += 1;
+            }
+        }
+
+        // Prompt for selection
+        println!("\nEnter the number to activate a configuration, or the group number to expand/collapse, or 'q' to quit:");
+        current_lines += 2; // "\n" plus the prompt line
+
+        lines_printed = current_lines;
         let mut input = String::new();
         io::stdin()
             .read_line(&mut input)
             .expect("Failed to read input");
+        lines_printed += 1; // Count the line where user typed their input
         let trimmed = input.trim();
+
         if trimmed.eq_ignore_ascii_case("q") {
             println!("Exiting without making changes.");
             std::process::exit(0);
         }
+
+        // Check if it's a sub-config selection (e.g., "2.1")
+        if trimmed.contains('.') {
+            let parts: Vec<&str> = trimmed.split('.').collect();
+            if parts.len() == 2 {
+                if let (Ok(group_num), Ok(sub_num)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+                    // Find the group at this position
+                    if group_num > 0 && group_num <= group_map.len() && !group_map[group_num - 1].is_empty() {
+                        let group_name = &group_map[group_num - 1];
+                        let group_configs: Vec<usize> = display_configs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.group.as_ref() == Some(group_name))
+                            .map(|(idx, _)| idx)
+                            .collect();
+
+                        if sub_num > 0 && sub_num <= group_configs.len() {
+                            return group_configs[sub_num - 1];
+                        }
+                    }
+                }
+            }
+            println!("Invalid selection. Please try again.");
+            continue;
+        }
+
+        // Regular number selection
         if let Ok(choice) = trimmed.parse::<usize>() {
-            if choice > 0 && choice <= total_configs {
-                return choice - 1;
+            if choice > 0 && choice <= config_map.len() {
+                let selected = config_map[choice - 1];
+
+                // Check if this is a group header
+                if selected == usize::MAX {
+                    // Toggle group expansion
+                    let group_name = &group_map[choice - 1];
+                    if let Some(group) = groups.iter_mut().find(|g| g.name == *group_name) {
+                        group.expanded = !group.expanded;
+                    }
+                    continue; // Re-display the menu
+                } else {
+                    // This is a valid config selection
+                    return selected;
+                }
             }
         }
-        println!(
-            "Invalid selection. Please enter a number between 1 and {}, or 'q' to quit.",
-            total_configs
-        );
+
+        println!("Invalid selection. Please try again.");
     }
 }
+
 
 /* ------------------------- helpers ------------------------- */
 
