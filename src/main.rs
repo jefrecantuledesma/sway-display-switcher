@@ -229,23 +229,54 @@ where
     let mut configs = Vec::new();
     let mut current_config = None;
     let mut current_group: Option<String> = None;
+    let mut group_start_line: Option<usize> = None;
+    let mut primary_monitor_depth = 0;
+    let mut primary_monitor_start_line: Option<usize> = None;
 
-    for line in lines {
+    let primary_start_regex = Regex::new(r"#!\s*Primary Monitor Start\s*!#").unwrap();
+    let primary_end_regex = Regex::new(r"#!\s*Primary Monitor End\s*!#").unwrap();
+
+    let lines_vec: Vec<&String> = lines.into_iter().collect();
+    for (line_idx, line) in lines_vec.iter().enumerate() {
+        // Check for Primary Monitor markers
+        if primary_start_regex.is_match(line) {
+            if primary_monitor_depth == 0 {
+                primary_monitor_start_line = Some(line_idx);
+            }
+            primary_monitor_depth += 1;
+        } else if primary_end_regex.is_match(line) {
+            primary_monitor_depth -= 1;
+            if primary_monitor_depth < 0 {
+                eprintln!("Warning: Found 'Primary Monitor End' at line {} without matching 'Primary Monitor Start'", line_idx + 1);
+                primary_monitor_depth = 0;
+            }
+        }
+
         // Check for end group marker
         if end_group_regex.is_match(line) {
+            if current_group.is_none() {
+                eprintln!("Warning: Found '## End Group ##' at line {} without matching '## Group = <name> ##'", line_idx + 1);
+            }
             // Push the previous config if it exists
             if let Some(config) = current_config.take() {
                 configs.push(config);
             }
             // Clear the current group
             current_group = None;
+            group_start_line = None;
         } else if let Some(captures) = group_regex.captures(line) {
+            // Check if previous group was closed
+            if let Some(group_name) = &current_group {
+                eprintln!("Warning: Group '{}' started at line {} was never closed with '## End Group ##'",
+                    group_name, group_start_line.unwrap_or(0) + 1);
+            }
             // Push the previous config if it exists
             if let Some(config) = current_config.take() {
                 configs.push(config);
             }
             // Set the current group
             current_group = Some(captures[1].trim().to_string());
+            group_start_line = Some(line_idx);
         } else if let Some(captures) = regex.captures(line) {
             // Push the previous config if it exists
             if let Some(config) = current_config.take() {
@@ -269,6 +300,17 @@ where
     // Push the last config if it exists
     if let Some(config) = current_config {
         configs.push(config);
+    }
+
+    // Final validation checks
+    if let Some(group_name) = &current_group {
+        eprintln!("Warning: Group '{}' started at line {} was never closed with '## End Group ##'",
+            group_name, group_start_line.unwrap_or(0) + 1);
+    }
+
+    if primary_monitor_depth > 0 {
+        eprintln!("Warning: 'Primary Monitor Start' at line {} was never closed with 'Primary Monitor End'",
+            primary_monitor_start_line.unwrap_or(0) + 1);
     }
 
     configs
