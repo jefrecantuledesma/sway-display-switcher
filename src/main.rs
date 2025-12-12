@@ -2,7 +2,6 @@ use expanduser::expanduser;
 use regex::Regex;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
 use std::process;
 
 // ANSI color codes using terminal's color scheme
@@ -167,12 +166,12 @@ fn main() -> io::Result<()> {
     }
 
     // Write all lines to a temporary file
-    let temp_path = Path::new("/home/fribbit/.config/sway/config_temp");
+    let temp_path = expanduser("~/.config/sway/config_temp").expect("Failed to expand temp config path");
     let temp_file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(temp_path)
+        .open(&temp_path)
         .expect("Failed to create temporary config file");
     let mut writer = BufWriter::new(temp_file);
 
